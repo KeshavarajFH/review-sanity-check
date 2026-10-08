@@ -14,9 +14,12 @@ The rule that makes this skill worth anything: **every check below ends in a com
 Everything is scoped to *what this branch changes*, not what the files contain. A file you touched may be full of pre-existing debt; that is not yours to answer for, and widening the diff to fix it makes review harder.
 
 ```bash
+git fetch origin <target-branch>
 BASE=$(git merge-base origin/<target-branch> HEAD)
 git diff $BASE --stat
 ```
+
+Fetch first. Without it `origin/<target-branch>` is whatever you last pulled, and the diff silently includes or omits other people's work.
 
 Use `$BASE` for every check. If you cannot name the target branch, ask — guessing produces a diff that includes other people's work.
 
@@ -29,11 +32,37 @@ git log $BASE..HEAD --format='%h %s' | cat
 git log $BASE..HEAD --format='%H' | xargs -I{} git show --format='%h %B' -s {} | rg -i 'no.?verify' || echo "clean"
 ```
 
-You cannot detect `--no-verify` from the commit object itself. What you *can* do is re-run the hooks over the final state:
+You cannot detect `--no-verify` from the commit object itself. What you *can* do is re-run the hooks over the final state and see whether they pass.
+
+First find which runner the repo uses — run only that one, and do not suppress its output. A failing hook exits non-zero; chaining runners with `||` turns that failure into "try the next runner" and hides it.
 
 ```bash
-npx lint-staged --diff="$BASE...HEAD" 2>/dev/null || npx prek run --from-ref "$BASE" --to-ref HEAD 2>/dev/null || echo "no hook runner configured"
+ls .husky .pre-commit-config.yaml lefthook.yml 2>/dev/null
+rg -n '"lint-staged"' package.json
 ```
+
+Pre-commit checks, over the whole branch. Start from a clean tree: these runners apply their fixers (`--fix`, `--write`), so any file they modify is code that would not have passed the hook as committed.
+
+```bash
+git status --short                                         # must be empty before you start
+npx --no-install lint-staged --diff="$BASE...HEAD"         # lint-staged repos
+prek run --from-ref "$BASE" --to-ref HEAD                  # pre-commit / prek repos
+git status --short                                         # anything listed now = the hook changed it
+```
+
+Commit-message checks, per commit. The commit-msg hook is the one `--no-verify` skips most often, and the pre-commit re-run above does not cover it:
+
+```bash
+HOOK="$(git config core.hooksPath || echo "$(git rev-parse --git-dir)/hooks")/commit-msg"
+MSG=$(mktemp)
+for c in $(git rev-list $BASE..HEAD); do
+  git log -1 --format=%B "$c" > "$MSG"
+  "$HOOK" "$MSG" >/dev/null 2>&1 && echo "ok   $(git log -1 --format='%h %s' "$c")" \
+                                 || echo "FAIL $(git log -1 --format='%h %s' "$c")"
+done
+```
+
+A `FAIL` line is a commit that could only have landed with the hook bypassed. If the repo has no commit-msg hook, `$HOOK` does not exist and every line fails — check `ls "$HOOK"` before reading the result.
 
 ## Step 2 — no unnecessary inline comments
 
@@ -61,11 +90,25 @@ rg -n 'screenName|data-testid|testID' --glob '!*test*' <your-source-dir> | head 
 git diff $BASE | rg '^\+.*<[A-Z]' | head -40                                          # components you added
 ```
 
-If your project has a lint rule for it, that rule is the check — run it and read the output rather than eyeballing:
+If your project has a lint rule for it, that rule is the check — run it and read the output rather than eyeballing. Linting whole files reports every pre-existing error in them too, which Step 0 says is not yours to answer for, so keep only findings on lines this branch changed. Run from the repo root:
 
 ```bash
-npx eslint $(git diff $BASE --name-only --diff-filter=d | rg '\.(ts|tsx|js|jsx)$')
+T=$(mktemp -d)
+git diff -U0 $BASE --diff-filter=d | awk '
+  /^\+\+\+ b\// { f = substr($0, 7) }
+  /^@@/ { split($3, a, ","); s = substr(a[1], 2); n = (a[2] == "" ? 1 : a[2])
+          for (i = 0; i < n; i++) print f ":" s + i }
+' > "$T/changed"
+FILES=$(git diff $BASE --name-only --diff-filter=d | rg '\.(ts|tsx|js|jsx)$')
+[ -n "$FILES" ] && npx --no-install eslint --format json $FILES \
+  | jq -r --arg root "$PWD/" '.[] | (.filePath | ltrimstr($root)) as $f
+      | .messages[] | "\($f):\(.line)\t\(.ruleId) \(.message)"' > "$T/all"
+awk -F'\t' 'NR==FNR { c[$0]; next } ($1 in c)' "$T/changed" "$T/all"
 ```
+
+The `[ -n "$FILES" ]` guard matters: with no matching files, a bare `npx eslint` lints the entire working directory. Use `--format json`; the `unix` and `compact` formatters were removed from ESLint 9.
+
+An empty result could also mean the pipeline broke, so check `wc -l "$T/all"` — it counts every finding in the changed files, including ones the filter dropped.
 
 Two traps worth knowing:
 - Rules of this kind usually check **prop presence, not value**. `id={someUndefinedConstant}` passes lint and renders `undefined` at runtime. Confirm the value resolves, by grepping the constants file it is imported from.
@@ -84,10 +127,13 @@ For each hit, ask where the object came from. Local object you just built: fine.
 Destructure at the top of the function with defaults, so the shape the function needs is stated once:
 
 ```js
-const { items = [], store: { id = null } = {} } = response ?? {};
+const { items = [], store } = response ?? {};
+const { id = null } = store ?? {};
 ```
 
-Also check array access, which optional chaining does not protect:
+Destructuring defaults apply only to `undefined`, not `null`. A nested pattern like `store: { id } = {}` still throws when the API sends `store: null`, so guard each nullable level with `?? {}`.
+
+Also check array access. `items?.[0]` and `items?.map(...)` protect against a missing array, but not an empty one: `items[0]` on `[]` is `undefined`, and the next `.name` throws.
 
 ```bash
 git diff $BASE | rg '^\+.*\[0\]|^\+.*\.map\(|^\+.*\.filter\(' | head -20
@@ -123,10 +169,28 @@ Resist extracting on the second occurrence — two call sites rarely reveal the 
 
 If the PR already has review comments, each one needs either a code change or a stated reason it was not changed. Replying "fixed" without a corresponding diff is the single fastest way to lose a reviewer's trust.
 
+Feedback lives in three places, and the REST `pulls/<n>/comments` endpoint returns only the first, with no resolved flag. Use GraphQL for inline threads so you can filter to unresolved ones:
+
 ```bash
-gh pr view --json number --jq .number
-gh api repos/<owner>/<repo>/pulls/<n>/comments --paginate \
-  --jq '.[] | "\(.id) \(.path):\(.line) \(.user.login): \(.body | gsub("\n";" ") | .[0:100])"'
+N=$(gh pr view --json number --jq .number)
+gh api graphql -F owner='{owner}' -F repo='{repo}' -F n="$N" -f query='
+  query($owner: String!, $repo: String!, $n: Int!) {
+    repository(owner: $owner, name: $repo) { pullRequest(number: $n) {
+      reviewThreads(first: 100) { nodes { isResolved path line originalLine
+        comments(first: 1) { nodes { author { login } body } } } } } } }' \
+  --jq '.data.repository.pullRequest.reviewThreads.nodes[] | select(.isResolved | not)
+        | .comments.nodes[0] as $c
+        | "\(.path):\(.line // .originalLine) \($c.author.login): \($c.body | gsub("\n";" ") | .[0:100])"'
+```
+
+`line` is `null` on outdated threads (the code moved), so the query falls back to `originalLine`. Outdated does not mean addressed. It caps at 100 threads; if you get exactly 100 back, page with `after:`.
+
+Review summaries and general PR comments have no resolved state. Read them all:
+
+```bash
+gh pr view "$N" --json reviews,comments --jq '
+  (.reviews[] | select(.body != "") | "review \(.author.login) \(.state): \(.body | gsub("\n";" ") | .[0:100])"),
+  (.comments[] | "comment \(.author.login): \(.body | gsub("\n";" ") | .[0:100])")'
 ```
 
 For every thread, before replying:
@@ -139,6 +203,7 @@ Then confirm the branch actually carries the work:
 
 ```bash
 git status --short                      # nothing important left uncommitted
+git fetch origin <branch>
 git rev-list --left-right --count origin/<branch>...HEAD   # nothing left unpushed
 ```
 
