@@ -1,0 +1,5 @@
+{
+    "name": "review-sanity-check",
+    "description": "Run a self-review pass over a change before opening a PR: commit hygiene, comment noise, unsafe property access, prop drilling, duplication, and a verified fix-list for any existing review comments.",
+    "author": { "name": "KeshavarajFH" }
+}

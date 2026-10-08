@@ -1,0 +1,16 @@
+{
+    "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+    "name": "review-sanity-check",
+    "description": "A pre-PR self-review checklist skill for Claude Code.",
+    "owner": { "name": "KeshavarajFH" },
+    "plugins": [
+        {
+            "name": "review-sanity-check",
+            "description": "Run a self-review pass over a change before opening a PR: commit hygiene, comment noise, unsafe property access, prop drilling, duplication, and a verified fix-list for any existing review comments.",
+            "author": { "name": "KeshavarajFH" },
+            "source": "./plugins/review-sanity-check",
+            "category": "development",
+            "homepage": "https://github.com/KeshavarajFH/review-sanity-check/tree/main/plugins/review-sanity-check"
+        }
+    ]
+}
