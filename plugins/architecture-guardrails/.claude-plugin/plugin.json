@@ -1,0 +1,8 @@
+{
+  "name": "architecture-guardrails",
+  "version": "0.1.0",
+  "description": "Record a repo's app-level and module-level guardrails — storage and persistence, token storage, navigation routes, cross-module action contracts, network, platform facades — each with its current value, location, check command and change protocol.",
+  "author": {
+    "name": "KeshavarajFH"
+  }
+}
