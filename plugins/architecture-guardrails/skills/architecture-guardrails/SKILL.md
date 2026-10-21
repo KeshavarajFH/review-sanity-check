@@ -1,6 +1,6 @@
 ---
 name: architecture-guardrails
-description: Build or refresh a repo's guardrail record — the app-level and module-level contracts that must not change casually (storage and persistence drivers, persisted state keys and versions, token storage, navigation routes, cross-module saga/action contracts, network setup, platform facades). Writes guardrails/APP.md and guardrails/modules/<Module>.md, each entry with its current value, file:line, why it is guarded, a check command with expected output, and what a PR must include to change it. Use when asked to "record guardrails", "map architecture constraints", "what must not change", "build GUARDRAILS", or after an incident caused by changing one of these surfaces.
+description: Build or refresh a repo's guardrail record — the app-level and module-level contracts that must not change casually (storage and persistence drivers, persisted state keys and versions, token storage, navigation routes, cross-module saga/action contracts, network setup, platform facades). Writes guardrails/APP.md and guardrails/modules/<Module>.md, each entry with its current value, file:line, why it is guarded, a check command with expected output, and what a PR must include to change it. Also mines guardrails/RULES.md — how the repo does things — from its written rules, enforced tooling, dominant code patterns and recurring PR review comments, each rule with sources, a detector proven on past PRs, and a draft/approved status. Use when asked to "record guardrails", "map architecture constraints", "what must not change", "build GUARDRAILS", "mine our coding rules", "what do reviewers keep asking for", or after an incident caused by changing one of these surfaces.
 ---
 
 # Architecture guardrails
@@ -13,8 +13,11 @@ The motivating failure: a feature branch switched the web persistence driver fro
 
 ```
 guardrails/
-  APP.md                 # app-level: one file
-  modules/<Module>.md    # module-level: one file per module
+  APP.md                 # app-level contracts: one file
+  modules/<Module>.md    # module-level contracts: one file per module
+  RULES.md               # how this repo does things (Step 3)
+  verify.sh              # checks APP.md and modules/ against the code
+  check-rules.sh         # runs RULES.md detectors over a branch
 ```
 
 Every entry has the same shape (templates in `templates/`):
@@ -169,7 +172,7 @@ for m in <module-root>/*/; do
 done | sort -rn | head -20
 ```
 
-The `[/'"]` before the name matters: without it, `BaseModule/` also counts every import of `T2SBaseModule/`.
+The `[/'"]` before the name matters: without it, `BaseModule/` also counts every import of `CoreBaseModule/`.
 
 For each module in scope, record:
 
@@ -191,7 +194,118 @@ For each module in scope, record:
 
 Skip any of these that returns nothing, and write "none found" with the command — an empty section is information.
 
-## Step 3 — write the files
+## Step 3 — rules
+
+Guardrails are values that must not change. Rules are **ways of writing code** the team expects: network calls go through the request layer, user-visible text is localised, sagas read state through selectors. Reviewers enforce them by hand, in comment after comment, because nobody wrote them down. This step writes them down, from evidence.
+
+Four sources, strongest first. A candidate rule needs at least one; it is stronger the more it has.
+
+Run this step's commands in `bash`. In zsh an unmatched glob aborts the whole command, and unquoted variables do not split, so steps silently return nothing.
+
+### 3.1 Written rules
+
+```bash
+git ls-files 'CLAUDE.md' 'AGENTS.md' 'CONTRIBUTING.md' '*/CLAUDE.md' '.cursor/rules/*' '.claude/skills/*/SKILL.md' 'docs/*standard*' 'docs/*guideline*'
+git grep -n -i -w -E 'must|never|do not|always|avoid|prefer|required|mandatory|instead of' -- <the files listed above>
+git grep -n -E '^[[:space:]]*([-*]|[0-9]+\.)[[:space:]]+(\*\*)?(No|Never|Don.t|Avoid) ' -- <the files listed above>
+```
+
+`-w` rather than `\b`: macOS's git uses the system regex library, which has no `\b`, and returns nothing instead of failing. The second search finds rules written as "No `console.log` in committed code". Read every match — do not truncate with `head`.
+
+Each normative sentence about code is a candidate, cited by `file:line`. Skip process rules (branching, commit messages, release steps) even when a hook enforces them; they are not about code.
+
+When two written sources disagree (one doc says `SCREEN_NAME.X`, another `SCREEN_OPTIONS.X.route_name`), measure which the code uses, pick that, and list the conflict in the report for the team to settle.
+
+### 3.2 Enforced tooling
+
+What blocks a commit or a merge is decided by the hooks and CI, not by the lint config alone — a rule can be `off` in `eslint.config.js` and turned on to `error` by a pre-commit script. Start from what runs:
+
+```bash
+git ls-files '.husky/*' 'lefthook.yml' '.pre-commit-config.yaml' '.github/workflows/*' '.gitlab-ci.yml' 'Jenkinsfile' 'bitrise.yml'
+```
+
+Read each hook and workflow, and every script they call, to the list of rules they enforce and at what level. Then read the lint config for rules on at `error` everywhere (core rules have no `plugin/` prefix — read the file rather than grepping for one shape).
+
+Record each enforced rule in `RULES.md` with `enforced:` naming the tool and **where it runs**: a local hook is skipped by `--no-verify`; CI is not. Enforced rules get no Detector — the review skill runs the repo's tools on the branch itself (its Step 2) — unless the tool only runs locally and the rule matters enough to check again.
+
+### 3.3 Dominant code patterns
+
+For each recurring kind of code, measure how the repo does it and whether it is consistent. Questions to ask — adapt to the stack:
+
+| Kind of code | Measure |
+|---|---|
+| Network calls | How do network modules make requests? (a request-descriptor object, a wrapper, raw `fetch`/`axios`) |
+| Storage | Which files touch storage SDKs or `localStorage` directly? |
+| Third-party SDKs | For each native or analytics SDK, how many files import it? One or two = a facade. |
+| Error handling | How do sagas/handlers log errors? (a logger, `console`, silent) |
+| User-visible text | Localisation object, or literals? |
+| State access | Do sagas `select` through selector functions or inline lambdas? |
+| UI primitives | The project's wrapped or design-system components, or raw primitives? |
+| Tests | Shared test runners or helpers every suite uses? |
+
+```bash
+# example: how network modules issue requests
+git grep -l -E '\bfetch\(' -- <src> ':!*__tests__*' | wc -l
+git grep -l -E 'method: *[A-Z_.]+, *$|url: ' -- '<src>/**/Network/*' | wc -l
+```
+
+A pattern followed by **at least 90% of at least 10 instances** is a candidate rule on its own. Record the counts and list the outliers — outliers are either bugs or a reason the rule needs an exception.
+
+A rule backed by written or review sources does not need to pass the 90% bar: in an older codebase, many team rules are rules *for new code*, and the old code is debt. Keep the rule, record the measurement under **Counter-evidence** ("raw `View` is still used in 2150 places vs 1230 wrapped"), and make sure its detector looks only at added lines.
+
+### 3.4 Review comments
+
+The richest source: what reviewers ask for again and again is a rule nobody wrote down.
+
+```bash
+bash <path-to-this-skill>/scripts/fetch-review-comments.sh <owner>/<repo> 1000 > "$T/comments.jsonl"
+jq -s 'length, (map(.pr) | unique | length), (group_by(.author) | map({author: .[0].author, n: length}) | sort_by(-.n))' "$T/comments.jsonl"
+```
+
+Read the comments and group them into **themes**: the same requested change, in different words, on different PRs ("remove inline comments", "comments not needed here", "delete this comment" are one theme). One comment can raise several themes.
+
+Tag as you read, in a file, so the counts can be recomputed and checked — not from memory:
+
+```bash
+# $T/tags.tsv: one line per (comment, theme) — "<url><TAB><theme>"
+jq -r '[.url, .pr, .author] | @tsv' "$T/comments.jsonl" > "$T/index.tsv"
+awk -F'\t' 'NR==FNR { pr[$1] = $2; au[$1] = $3; next }
+  { c[$2]++; p[$2 SUBSEP pr[$1]] = 1; r[$2 SUBSEP au[$1]] = 1 }
+  END { for (k in p) { split(k, a, SUBSEP); np[a[1]]++ } for (k in r) { split(k, a, SUBSEP); nr[a[1]]++ }
+        for (t in c) print c[t], np[t], nr[t], t }' "$T/index.tsv" "$T/tags.tsv" | sort -rn
+```
+
+Before counting:
+- **Drop bots.** Their comments are not team practice.
+- **Collapse twin PRs.** The same change merged to two release branches carries the same comments; count the pair as one PR.
+
+A theme is a candidate rule when it appears in **3 or more PRs and is backed by 2 or more reviewers, or by one reviewer plus a written or pattern source.** When one reviewer writes most of the comments, a theme only they raise may be their preference rather than the team's: list it as a single-reviewer candidate in the report instead of writing it as a rule. Skip one-off bug reports (a specific off-by-one) — they are findings, not rules; a *kind* of bug reported repeatedly (missing guards before network calls) is a rule.
+
+The comments stay in the repo's own `guardrails/RULES.md`. They are internal: never paste them anywhere public.
+
+### 3.5 Merge, write detectors, prove them
+
+Merge candidates that say the same thing; a merged rule cites every source. Then, for each rule:
+
+1. **Write the rule as an instruction**, with the failure it prevents. "Use the request layer" is weaker than "Network calls go through the request layer; a raw `fetch` sends no auth header and is not retried on token expiry".
+2. **Pick an example** of the repo doing it right, `file:line`.
+3. **Write a Detector** when the violation is visible in added lines. It runs under `check-rules.sh` from the repo root, with `$ADDED` (a file of `path:line<TAB>text` for every added line — split on the tab, then on the *last* `:`), `$BASE` and `$TIP`; it prints `path:line — text` per violation and exits 0 — end searches with `|| true`. Prefer `awk` over `$ADDED`; use `git show "$TIP:<path>"` or `git grep ... "$TIP"` when the rule needs the whole file. When no command can see the violation (races, naming quality), write a **Review question** instead. A rule can have both: a detector for the visible part, a question for the rest.
+4. **Prove the detector on history.** For a rule mined from review comments, run it on the PR commit where a reviewer flagged the problem — the comment's `commit` field — against that PR's base:
+   ```bash
+   base=$(gh api repos/<owner>/<repo>/pulls/<pr> --jq .base.sha)
+   mb=$(gh api "repos/<owner>/<repo>/compare/$base...<commit>" --jq .merge_base_commit.sha)
+   git fetch -q origin <commit> "$mb"
+   bash <path-to-this-skill>/scripts/check-rules.sh --drafts --rule RULE-X-001 "$mb" <commit> guardrails/RULES.md
+   ```
+   It must print the file the reviewer commented on, at or near the comment's `original_line` (the line in the version the reviewer saw; `line` is the PR head's). Then run it on **a real merged PR where the theme never came up** — one with added lines, ideally touching the same kind of file. It must print nothing there. An empty range such as `$mb..$mb` is not a clean test: with no added lines, every detector prints nothing, including one that prints every line. Record both runs in **Proven on**. A detector that cannot be proven is replaced by a Review question, not shipped.
+
+   A PR that merged a release branch into itself has other people's code in its diff; for the negative run, prefer a PR without such merges.
+5. **Set Severity.** *High*: the violation causes a production failure — a crash, lost or wrong data, a security hole, a wrong charge. *Medium*: a user-visible defect, or a cost every later change pays (state that drifts, a bypassed facade). *Low*: consistency and readability.
+6. **Set Status to `draft`.** Only the team approves rules.
+
+Use `templates/RULES.md` for the file. Rules a team member has approved or rejected keep their status on a refresh; on a refresh, re-run every detector's proof and report the ones that no longer pass.
+
+## Step 4 — write the files
 
 Use `templates/APP.md` and `templates/MODULE.md`. Each file starts with:
 
@@ -216,9 +330,9 @@ A PR that changes a guarded value is allowed, but it must say so. The PR descrip
 
 and updates the guardrail entry (value, `Where`, expected check output) in the same PR. A PR that changes a guarded value without this section is a review finding. How that is enforced — reviewer, review skill, CI — is the repo's choice; this skill only makes the contracts and their checks explicit.
 
-## Step 4 — verify the record
+## Step 5 — verify the record
 
-Copy `scripts/verify-guardrails.sh` from this skill into the repo (`guardrails/verify.sh`), so the record carries its own checker. It extracts every entry's Check block, runs it from the repo root, and diffs the output against the Expected block:
+Copy `scripts/verify-guardrails.sh` and `scripts/check-rules.sh` from this skill into the repo (`guardrails/verify.sh`, `guardrails/check-rules.sh`), so the record carries its own checkers. It extracts every entry's Check block, runs it from the repo root, and diffs the output against the Expected block:
 
 ```bash
 bash guardrails/verify.sh --show guardrails/APP.md guardrails/modules/*.md   # actual output of every check
@@ -248,3 +362,5 @@ Report each mutation and its result. A guarded change that passes all checks is 
 State which areas and modules you covered and which you did not, the number of entries in each file, the verifier result (`N/N checks match`), each mutation you ran and whether its check failed, which areas returned nothing (with the command), which entries are `judged` rather than measured, and — on a refresh — every entry whose value changed since the last `verified at`. Changed contracts are the headline: someone moved one without the protocol.
 
 Contract lines you had to correct after running their check are worth listing too: they are the places the team's mental model of the code is out of date.
+
+For rules: candidates found per source (written, enforced, pattern, review themes), how many became rules, how many have a proven detector and how many are review questions, and the list of draft rules awaiting approval — the team's next action. List themes you dropped and why (one PR only, a one-off bug, a bot), so a reader can disagree.
