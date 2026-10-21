@@ -1,11 +1,13 @@
 ---
 name: review-sanity-check
-description: Run before opening a pull request, before pushing a branch for review, when reviewing someone else's PR, or whenever asked to "self review", "sanity check my changes", "is this ready for PR", or to confirm review comments are addressed. Checks the diff for bypassed commit hooks, comment noise, missing identification props, unsafe property access, prop drilling, misleading names, and duplication — each verified by running a command, not by reading the code. Verifies every review thread has a code change or a reply behind it, and ends in a READY / NOT READY verdict.
+description: Run before opening a pull request, before pushing a branch for review, when reviewing someone else's PR, or whenever asked to "review this PR", "self review", "sanity check my changes", "is this ready for PR", or to confirm review comments are addressed. Checks the branch against the repo's own standards and guardrails, runs detectors for runtime crashes and production risks (missing exports and keys, leaks, non-production hosts, hardcoded strings, dead code), and walks every changed file through a role checklist (saga races and guards, persistence, selector defaults, test sensitivity). Also checks bypassed hooks, comments, identification props, unsafe access, prop drilling, naming, duplication and review threads. Ends in a READY / NOT READY verdict with a per-check table.
 ---
 
 # Review sanity check
 
 A review pass over a branch, run **before** anyone else is asked to look at it — or when you are the one asked to look.
+
+It answers one question: **does this branch do things the way this repo does them, and will it hold up in production?** Three sources of "the way this repo does them", in order: the repo's own enforced tooling and written rules (Step 2), its recorded guardrails (Step 3), and the shared production-risk checks in this skill (Steps 4–5).
 
 The rule that makes this skill worth anything: **every check below ends in a command you run and read the output of.** A check you performed by eye is not a check. Most of these failures are invisible on a read-through and obvious in one `git diff` or `ast-grep`.
 
@@ -18,6 +20,7 @@ git fetch origin <target-branch>
 TIP=HEAD                                                      # your own branch, checked out
 # TIP=pr-<n>; git fetch origin pull/<n>/head:$TIP             # someone else's PR, no checkout needed
 BASE=$(git merge-base origin/<target-branch> $TIP)
+N=$(gh pr view --json number --jq .number 2>/dev/null)       # your branch's PR; for someone else's: N=<n>
 T=$(mktemp -d)
 git diff $BASE $TIP > "$T/branch.diff"
 git diff $BASE $TIP --stat
@@ -33,9 +36,21 @@ git diff -U0 $BASE $TIP --diff-filter=d | awk '
   /^@@/ { split($3, a, ","); s = substr(a[1], 2); n = (a[2] == "" ? 1 : a[2])
           for (i = 0; i < n; i++) print f ":" s + i }
 ' > "$T/changed"
-for f in $(git diff $BASE $TIP --name-only --diff-filter=d | rg '\.(js|jsx|ts|tsx)$'); do
+for f in $(git diff $BASE $TIP --name-only --diff-filter=d | grep -E '\.(js|jsx|ts|tsx)$'); do
   mkdir -p "$T/head/$(dirname "$f")" && git show "$TIP:$f" > "$T/head/$f"
 done
+```
+
+Tools that resolve imports or read other files (lint, the reference checker, the repo's own scripts) need a real checkout of `$TIP`. When it is not checked out, make a temporary worktree and link the dependencies; remove it at the end:
+
+```bash
+WT=$PWD
+if [ "$TIP" != HEAD ]; then
+  git worktree add -q --detach "$T/wt" $TIP && ln -s "$PWD/node_modules" "$T/wt/node_modules"
+  WT="$T/wt"
+fi
+# ... at the end of the review:
+[ "$TIP" != HEAD ] && git worktree remove --force "$T/wt"
 ```
 
 In zsh, a command stored in a variable (`D="git diff $BASE"; $D`) does not word-split and fails with "command not found". Write output to a file, as above, instead.
@@ -89,7 +104,96 @@ done
 
 A `FAIL` line is a commit that could only have landed with the hook bypassed. It is a NOT READY condition: reword the commits (on an unshared branch) or say why they cannot be.
 
-## Step 2 — no inline comments
+## Step 2 — the repo's own standards
+
+The repo's rules come first: they are what its reviewers will hold the branch to. Find them before running anything of your own.
+
+```bash
+ls CLAUDE.md AGENTS.md CONTRIBUTING.md .cursor/rules docs/*standard* docs/*guideline* 2>/dev/null
+ls guardrails/RULES.md 2>/dev/null                         # rules recorded by the architecture-guardrails skill
+ls scripts/ 2>/dev/null | grep -i -E 'check|lint|standard|guard'
+jq -r '.scripts | to_entries[] | select(.key | test("lint|check|standard|guard")) | "\(.key): \(.value)"' package.json
+```
+
+Read the written rules. For each rule in `guardrails/RULES.md` marked approved, run its detector. Treat written rules as checks: a rule the branch breaks is a finding with the rule's own wording.
+
+Run every standards script the repo has **over the whole branch**, not just staged files — commits made with `--no-verify` never ran them. Many accept a base ref (`--base`, `--from-ref`, `--diff`); read the script's usage line and pass `$BASE`. Run them in `$WT`:
+
+```bash
+(cd "$WT" && node scripts/<check-script>.js --base "$BASE")   # each one you found
+```
+
+Lint over the changed files in `$WT`, keeping only findings on changed lines. ESLint's own warnings go to a file so they do not bury the findings:
+
+```bash
+FILES=$(git diff $BASE $TIP --name-only --diff-filter=d | grep -E '\.(ts|tsx|js|jsx)$')
+ROOT="$(cd "$WT" && pwd -P)/"
+[ -n "$FILES" ] && (cd "$WT" && npx --no-install eslint --format json $(echo $FILES) 2> "$T/lint.err") \
+  | jq -r --arg root "$ROOT" '.[] | (.filePath | ltrimstr($root)) as $f
+      | .messages[] | "\($f):\(.line)\t\(.ruleId) \(.message)"' > "$T/lint"
+wc -l < "$T/lint"                                          # 0 can also mean a config error — read $T/lint.err
+awk -F'\t' 'NR==FNR { c[$0]; next } ($1 in c)' "$T/changed" "$T/lint"
+```
+
+Where a repo script already enforces something later steps also check (comments, identification props, prop counts, duplication), its result is the answer for that step; the later step only covers what the script does not.
+
+## Step 3 — guardrails
+
+If the repo has a `guardrails/` record (from the architecture-guardrails skill), check the branch against it:
+
+```bash
+ls guardrails/APP.md guardrails/modules/ 2>/dev/null
+(cd "$WT" && bash guardrails/verify.sh guardrails/APP.md guardrails/modules/*.md)
+```
+
+Every `FAIL` is a guarded contract this branch changes: a storage driver, a persist key, a route, an action type another module's saga takes. That is allowed only with a `## Guardrail change` section in the PR description naming the ID and covering migration and rollback:
+
+```bash
+gh pr view "$N" --json body --jq .body | grep -A8 '## Guardrail change'
+```
+
+A failed guardrail without that section is a NOT READY finding, whatever the size of the diff — the incident this exists for was three lines in a storage facade. A section that names the ID but does not answer "existing data / callers" is a finding too.
+
+No `guardrails/` directory: say so in the report, and apply S8 and R1 (Step 5) with extra care — they are the checks closest to it.
+
+## Step 4 — detectors
+
+Two scripts ship with this skill. Run both; every hit is a lead to confirm or dismiss, with a reason, in the report.
+
+```bash
+SKILL=<path to this skill's directory>
+(cd "$WT" && node "$SKILL/scripts/check-references.js" "$T/changed" $(echo $FILES))
+bash "$SKILL/scripts/detect.sh" "$BASE" "$TIP"
+```
+
+`check-references.js` reports references that are `undefined` at runtime: an imported name the module does not export, `CONST.KEY` where the constants object has no such key, a localisation key missing from the default language table. These crash or render `undefined` and pass lint. Treat each as confirmed unless the module builds the object dynamically.
+
+`detect.sh` prints one `RULE path:line — detail` per hit:
+
+| Rule | Lead | Confirm with |
+|---|---|---|
+| `CONSOLE` | logging left in a production path | always a finding outside tests |
+| `NONPROD-HOST` | stage/SIT/QA/localhost URL in code | a finding unless it is an environment-map entry |
+| `NONPROD-DEFAULT` | fallback to a non-production value | CFG1 |
+| `RAW-FETCH`, `RARE-IMPORT` | an API or SDK the repo almost never uses directly | N1, C7 — the detail names the existing facade |
+| `UNSTOPPED-ANIMATION`, `UNCLEARED-*`, `UNREMOVED-LISTENER` | work started with fewer stops than starts | C3 |
+| `MODULE-SCOPE-DIMENSIONS` | window size read once at load | C6 |
+| `JSX-LITERAL`, `REPEATED-LITERAL` | user-visible English; a string repeated 3+ times | C5; a repeated *domain* value (a type, status or field name) is a finding — a missing constant |
+| `SMALL-FONT` | text under 10 pt | C5 |
+| `UNREAD-EXPORT`, `UNIMPORTED-FILE`, `UNUSED-STYLE` | dead code | X3 |
+| `NEW-STATE-FIELD` | a field added to a reducer | R1, R2, R4 for each one |
+| `UNREAD-STATE-FIELD` | a new field no file outside the reducer reads | R4 — a finding unless a reader is added elsewhere |
+| `ARTIFACT` | machine-local file committed | always a finding |
+
+## Step 5 — role pass
+
+Read `references/role-checklists.md` (in this skill's directory). Give every changed file a role — saga, reducer, selector, network, config, component, test — and answer each of that role's questions with evidence, or `n/a` with the reason. Sagas, reducers and selectors first.
+
+This is where most high-severity problems are found: races between watchers, optimistic writes that never revert, work that runs after a reset, selectors that default a feature to on, transient state that persists. None of them is visible on the changed line alone — each question names what else to open.
+
+Record every answer. A question you did not answer is reported as not checked, never as passed.
+
+## Step 6 — no inline comments
 
 **An added comment line is a finding by default.** The reasoning behind a change belongs in the commit message or the PR description, where the reviewer reads it and where it cannot drift out of date with the code. A comment explaining *what* a line does is a naming problem: rename the thing.
 
@@ -105,7 +209,7 @@ awk '
 
 Report the total and every file in it. A non-zero total is a finding; list the lines (`rg -n '^\+\s*(//|/\*|\*|\{/\*)' "$T/branch.diff"`) and either delete each one or move its content into the PR description. JSDoc blocks on internal functions count — a long docblock explaining a saga's behaviour is a PR description that got committed.
 
-## Step 3 — component identification props
+## Step 7 — component identification props
 
 **Project-specific — edit this section for your codebase, or delete it.**
 
@@ -134,31 +238,29 @@ rule:
 EOF
 sed 's/language: javascript/language: tsx/' "$T/ids.yml" > "$T/ids-tsx.yml"
 (cd "$T/head" && ast-grep scan -r "$T/ids.yml" --json=stream . ; ast-grep scan -r "$T/ids-tsx.yml" --json=stream .) \
-  | jq -r '"\(.file | ltrimstr("./")):\(.range.start.line + 1)\t\(.ruleId)\t\(.text | split("\n")[0] | .[0:60])"' \
+  | jq -r --arg base "<base-component-dir>/" '
+      select(.ruleId != "raw-primitive" or (.file | ltrimstr("./") | startswith($base) | not))
+      | "\(.file | ltrimstr("./")):\(.range.start.line + 1)\t\(.ruleId)\t\(.text | split("\n")[0] | .[0:60])"' \
   | awk -F'\t' 'NR==FNR { c[$0]; next } ($1 in c)' "$T/changed" -
 ```
 
-Adjust the `^T2S` prefix and the attribute names to your convention. Each `missing-id` hit needs both props; each `raw-primitive` hit needs converting, or a `setTestId` spread plus a stated reason it cannot convert (a ref a library grabs, a native-driver animation).
+Adjust the `^T2S` prefix, the attribute names and `<base-component-dir>` (where the wrapped components are defined — `raw-primitive` skips it, because the wrappers are where raw primitives are meant to live) to your convention. Each `missing-id` hit needs both props; each `raw-primitive` hit needs converting, or a `setTestId` spread plus a stated reason it cannot convert (a ref a library grabs, a native-driver animation).
 
-Then run the lint rule as well, filtered to changed lines — it catches what the structural check does not. `--stdin-filename` lets it lint the `$TIP` copy with the repo's own config:
+The lint run in Step 2 covers the identification rule; this structural check catches what it exempts.
+
+Changes to the directory that defines the wrapped components themselves are a separate finding — those components are shared by every screen:
 
 ```bash
-: > "$T/lint"
-for f in $(git diff $BASE $TIP --name-only --diff-filter=d | rg '\.(ts|tsx|js|jsx)$'); do
-  git show "$TIP:$f" | npx --no-install eslint --stdin --stdin-filename "$f" --format json \
-    | jq -r --arg f "$f" '.[] | .messages[] | "\($f):\(.line)\t\(.ruleId) \(.message)"' >> "$T/lint"
-done
-wc -l < "$T/lint"                                          # 0 here can also mean the pipeline broke
-awk -F'\t' 'NR==FNR { c[$0]; next } ($1 in c)' "$T/changed" "$T/lint"
+git diff $BASE $TIP --name-status -- <base-component-dir> | cat
 ```
 
-When `$TIP` is not checked out, `import/no-unresolved` hits on new files are false: the resolver looks at your working tree. Confirm each with `git cat-file -e "$TIP:<path>"` before reporting it.
+Any line here needs the component owners' approval. Read each changed component too: a wrapper copied from elsewhere can carry that file's bugs (a `propType` typo that silently disables prop validation).
 
 Two traps worth knowing:
 - Rules of this kind usually check **prop presence, not value**. `id={VIEW_ID.SOMETHING}` passes and renders `undefined` if the key does not exist. Confirm every added key resolves in the constants file it is imported from.
 - An element with a spread (`{...props}`) is typically skipped by static analysis entirely. Those need reading by hand.
 
-## Step 4 — destructuring and safety checks
+## Step 8 — destructuring and safety checks
 
 Unsafe property access on data that crosses a boundary — an API response, route params, redux state — is the most common runtime crash in a diff that reviews cleanly.
 
@@ -183,7 +285,7 @@ Also check array access. `items?.[0]` and `items?.map(...)` protect against a mi
 rg '^\+.*\[0\]|^\+.*\.map\(|^\+.*\.filter\(' "$T/branch.diff" | head -20
 ```
 
-## Step 5 — read state where it is used, not through props
+## Step 9 — read state where it is used, not through props
 
 A child that needs state should subscribe to it, not receive it through a chain of parents. Long prop lists are the symptom; the cost is that every intermediate component re-renders on changes it does not care about, and adding one field means editing every file in the chain.
 
@@ -209,7 +311,7 @@ The count includes props of JSX passed *as* a prop, so a step component wrapping
 
 For each hit, list which props are data the parent itself got from `useSelector`, a hook, or the store. Those are findings: the child should select them. The exception is what is genuinely the parent's to decide — a callback, a variant, a layout flag, a rendered slot. The test is whether the value is *state the child could look up itself* or *a decision the parent is making*.
 
-## Step 6 — names do not collide with the codebase's vocabulary
+## Step 10 — names do not collide with the codebase's vocabulary
 
 A name that means something else in this codebase misleads every later reader. In a Redux codebase `*Selector` means a reselect selector; a component or a JSX-holding variable named `dateSelector` reads as state access.
 
@@ -232,7 +334,7 @@ sort -u "$T/names" | while read -r n; do rg -q "^\+.*\b$n\b" "$T/branch.diff" &&
 
 A name is a finding when a changed line uses it (Step 0). Rename it to say what it is: `DatePicker`, `dateField`, `TableFloorPicker`.
 
-## Step 7 — no duplicated code
+## Step 11 — no duplicated code
 
 New duplication is what this catches; pre-existing duplication is a separate job.
 
@@ -245,14 +347,13 @@ Repeated lines are a weak signal, so read the hits rather than trusting the coun
 
 Resist extracting on the second occurrence — two call sites rarely reveal the right abstraction, and a premature one is harder to unpick than the duplication. On the third, extract.
 
-## Step 8 — every review thread has a change or a reply behind it
+## Step 12 — every review thread has a change or a reply behind it
 
 Each review comment needs either a code change or a reply stating why it was not changed. Replying "fixed" without a corresponding diff is the single fastest way to lose a reviewer's trust; not replying at all is a close second.
 
 Feedback lives in three places, and the REST `pulls/<n>/comments` endpoint returns only the first, with no resolved flag. Use GraphQL for inline threads, with the comment count so unanswered threads show:
 
 ```bash
-N=$(gh pr view --json number --jq .number)                  # or the PR number you are reviewing
 gh pr view "$N" --json reviewDecision --jq .reviewDecision
 gh api graphql -F owner='{owner}' -F repo='{repo}' -F n="$N" -f query='
   query($owner: String!, $repo: String!, $n: Int!) {
@@ -290,7 +391,7 @@ git rev-list --left-right --count origin/<branch>...HEAD   # nothing left unpush
 
 An unpushed fix is not a fix. Check this before you reply, not after.
 
-## Step 9 — the diff contains only what you meant
+## Step 13 — the diff contains only what you meant
 
 ```bash
 git diff $BASE $TIP --stat
@@ -305,10 +406,33 @@ Start with the verdict.
 
 **NOT READY** if any of these hold:
 - a commit fails the commit-msg hook, or the pre-commit re-run fails or modifies files (Step 1);
-- any finding from Steps 2–7 is in scope by Step 0's rules;
-- a review thread is unaddressed — no change behind it and no reply (Step 8);
+- a repo standards script or written rule fails on the branch (Step 2);
+- a guardrail check fails without a matching `## Guardrail change` section (Step 3);
+- a detector hit is confirmed (Step 4), or a role question fails (Step 5);
+- any finding from Steps 6–11 is in scope by Step 0's rules;
+- a review thread is unaddressed — no change behind it and no reply (Step 12);
 - the PR's review decision is `CHANGES_REQUESTED` and the requested changes are not all made or answered.
 
 **READY** only when none hold.
 
-Then list findings by step, each with `file:line` and the command that produced it. Where a check found nothing, say so — "0 comment lines added" is information. Where you judged rather than measured, say which. Do not report a check as passed if you did not run its command, and do not soften a NOT READY verdict with "the code is in good shape": if the code were in good shape, the verdict would say so.
+Then a table of **every check**, so a reader can see what was and was not looked at:
+
+| Check | Result | Evidence |
+|---|---|---|
+| Step 1 commit-msg hook | fail | 3 of 8 commits: `abc123`, … |
+| Step 2 `scripts/check-changed-lines.js --base` | pass | exit 0 |
+| Step 3 GR-APP-STORAGE-001 | fail | driver line changed; no Guardrail change section |
+| Step 4 MISSING-KEY | fail | `Screen.js:162` `SCREEN_NAME.X` |
+| Step 5 S2 concurrent watchers (`CartSaga.js`) | fail | apply/remove interleaving, see finding 3 |
+| Step 5 SEL1 (`CartSelectors.js`) | n/a | no selector returns a new object |
+| Step 5 T4 sensitivity | not checked | no test run in this review |
+
+Then the findings, highest severity first, each with `file:line`, what is wrong, why it matters in production, and the check that found it. Where a check found nothing, say so — "0 comment lines added" is information. Where you judged rather than measured, say which. Do not report a check as passed if you did not run it, and do not soften a NOT READY verdict with "the code is in good shape": if the code were in good shape, the verdict would say so.
+
+End with the findings as JSON, so runs can be compared over time:
+
+```json
+{"verdict": "NOT READY", "findings": [{"file": "path", "line": 1, "check": "Step 5 S2", "severity": "high", "summary": "..."}]}
+```
+
+Remove the worktree from Step 0 if you made one.
