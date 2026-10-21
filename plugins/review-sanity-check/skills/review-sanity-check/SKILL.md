@@ -115,7 +115,13 @@ ls scripts/ 2>/dev/null | grep -i -E 'check|lint|standard|guard'
 jq -r '.scripts | to_entries[] | select(.key | test("lint|check|standard|guard")) | "\(.key): \(.value)"' package.json
 ```
 
-Read the written rules. For each rule in `guardrails/RULES.md` marked approved, run its detector. Treat written rules as checks: a rule the branch breaks is a finding with the rule's own wording.
+Read the written rules. If the repo has `guardrails/RULES.md` (mined by the architecture-guardrails skill), run its approved rules over the branch:
+
+```bash
+(cd "$WT" && bash guardrails/check-rules.sh "$BASE" "$TIP")    # prints RULE-ID path:line — text; exit 2 = a broken detector
+```
+
+Each line is a finding in the rule's own words, with the rule's severity. Rules that have a **Review question** instead of a detector join Step 5's role pass: answer them for every changed file they apply to. Draft rules are not applied — they have not been approved. Treat other written rules the same way: a rule the branch breaks is a finding.
 
 Run every standards script the repo has **over the whole branch**, not just staged files — commits made with `--no-verify` never ran them. Many accept a base ref (`--base`, `--from-ref`, `--diff`); read the script's usage line and pass `$BASE`. Run them in `$WT`:
 
